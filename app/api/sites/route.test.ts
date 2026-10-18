@@ -18,6 +18,7 @@ vi.mock("next/server", () => ({ after }));
 
 import { createTestDb, type TestDb } from "@/lib/testing/pglite";
 import { SERVERLESS_MAX_DURATION_S } from "@/lib/jobs/config";
+import { setSitePolicy } from "@/lib/site-policy";
 import { maxDuration, POST } from "./route";
 
 let t: TestDb;
@@ -38,6 +39,7 @@ beforeEach(async () => {
   await db.site.deleteMany();
   after.mockClear();
   vi.unstubAllEnvs();
+  setSitePolicy(null);
 });
 
 const add = (gscProperty: string) =>
@@ -60,5 +62,23 @@ describe("POST /api/sites", () => {
     expect((await add("sc-domain:quilltab.app")).status).toBe(201);
     expect(after).toHaveBeenCalledTimes(1);
     expect(maxDuration).toBe(SERVERLESS_MAX_DURATION_S);
+  });
+
+  it("refuses a site the site policy does not allow, and creates nothing", async () => {
+    const canAdd = vi.fn(async () => ({ ok: false as const, reason: "Verify this site in Search Console first", status: 403 }));
+    setSitePolicy({ canAdd });
+    const res = await add("sc-domain:quilltab.app");
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: "Verify this site in Search Console first" });
+    expect(canAdd).toHaveBeenCalledWith({ id: "u1" }, { domain: "quilltab.app", gscProperty: "sc-domain:quilltab.app" });
+    expect(await db.site.count()).toBe(0);
+  });
+
+  it("tells the site policy about the new site", async () => {
+    const afterCreate = vi.fn(async () => {});
+    setSitePolicy({ afterCreate });
+    const res = await add("sc-domain:quilltab.app");
+    const site = (await res.json()) as { id: string };
+    expect(afterCreate).toHaveBeenCalledWith(expect.objectContaining({ id: site.id, userId: "u1", domain: "quilltab.app" }));
   });
 });

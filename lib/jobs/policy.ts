@@ -2,8 +2,9 @@
  * The crawl rules every entry point applies: the page ceiling and the check
  * whether a site may start a crawl now. The crawl route, the MCP tool and the
  * engine all go through this module, so the page count a browser sends is
- * never the only limit. A deployment that needs stricter rules changes them
- * here, in one place.
+ * never the only limit. A deployment that needs stricter rules registers its
+ * own policy with setCrawlPolicy (from extensions/index.ts) instead of editing
+ * this file.
  */
 
 /** The page ceiling when CRAWL_MAX_PAGES is unset or invalid. */
@@ -48,4 +49,15 @@ export type CrawlPolicy = (
   ctx: { source: CrawlRequestSource; maxPages: number }
 ) => Promise<CrawlPermission>;
 
-export const canStartCrawl: CrawlPolicy = async () => ({ ok: true });
+const allowEveryCrawl: CrawlPolicy = async () => ({ ok: true });
+
+/** On globalThis like the job handler registry: a route and a server action may load separate copies of this module. */
+const policyHolder = globalThis as unknown as { crawlseoCrawlPolicy?: CrawlPolicy };
+
+/** Replaces the crawl policy for this process. null restores the default, which allows every crawl. */
+export function setCrawlPolicy(policy: CrawlPolicy | null): void {
+  policyHolder.crawlseoCrawlPolicy = policy ?? undefined;
+}
+
+/** Asks the registered policy, or allows the crawl when none is registered. */
+export const canStartCrawl: CrawlPolicy = (site, ctx) => (policyHolder.crawlseoCrawlPolicy ?? allowEveryCrawl)(site, ctx);

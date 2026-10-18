@@ -2,6 +2,7 @@ import { auth } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { assertPublicDomain } from "@/lib/crawler/engine";
 import { siteDomainFromProperty } from "@/lib/site-domain";
+import { canUpdateSite, siteDeleted } from "@/lib/site-policy";
 
 export async function GET(
   req: Request,
@@ -77,7 +78,7 @@ export async function PUT(
     // Verify ownership
     const site = await db.site.findUnique({
       where: { id: siteId },
-      select: { userId: true },
+      select: { userId: true, domain: true, gscProperty: true },
     });
 
     if (!site || site.userId !== session.user.id) {
@@ -105,6 +106,19 @@ export async function PUT(
           { error: "Domain must resolve to a public IP address" },
           { status: 400 }
         );
+      }
+    }
+
+    // Only a real change: resending the current values must not be refused.
+    const nextDomain = normalizedDomain || site.domain;
+    const nextProperty = gscProperty || site.gscProperty;
+    if (nextDomain !== site.domain || nextProperty !== site.gscProperty) {
+      const permission = await canUpdateSite(
+        { id: session.user.id },
+        { id: siteId, domain: nextDomain, gscProperty: nextProperty }
+      );
+      if (!permission.ok) {
+        return Response.json({ error: permission.reason }, { status: permission.status });
       }
     }
 
@@ -194,7 +208,7 @@ export async function DELETE(
     // Verify ownership
     const site = await db.site.findUnique({
       where: { id: siteId },
-      select: { userId: true },
+      select: { userId: true, domain: true },
     });
 
     if (!site || site.userId !== session.user.id) {
@@ -205,6 +219,8 @@ export async function DELETE(
     await db.site.delete({
       where: { id: siteId },
     });
+
+    await siteDeleted({ id: siteId, userId: site.userId, domain: site.domain });
 
     return Response.json({ success: true });
   } catch (error) {

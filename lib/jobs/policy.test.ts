@@ -1,10 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   canStartCrawl,
   clampMaxPages,
   crawlPageCeiling,
   DEFAULT_CRAWL_PAGE_CEILING,
   DEFAULT_CRAWL_PAGES,
+  setCrawlPolicy,
 } from "./policy";
 
 describe("crawlPageCeiling", () => {
@@ -68,5 +69,26 @@ describe("canStartCrawl", () => {
     await expect(
       canStartCrawl({ id: "s1", userId: "u1" }, { source: "manual", maxPages: 200 })
     ).resolves.toEqual({ ok: true });
+  });
+
+  describe("with a registered policy", () => {
+    afterEach(() => setCrawlPolicy(null));
+
+    it("asks the registered policy, with the site and the request", async () => {
+      const policy = vi.fn(async () => ({ ok: false as const, reason: "Too soon", status: 429 }));
+      setCrawlPolicy(policy);
+      await expect(
+        canStartCrawl({ id: "s1", userId: "u1" }, { source: "mcp", maxPages: 500 })
+      ).resolves.toEqual({ ok: false, reason: "Too soon", status: 429 });
+      expect(policy).toHaveBeenCalledWith({ id: "s1", userId: "u1" }, { source: "mcp", maxPages: 500 });
+    });
+
+    it("goes back to allowing every crawl when reset", async () => {
+      setCrawlPolicy(async () => ({ ok: false, reason: "No", status: 403 }));
+      setCrawlPolicy(null);
+      await expect(
+        canStartCrawl({ id: "s1", userId: "u1" }, { source: "schedule", maxPages: 200 })
+      ).resolves.toEqual({ ok: true });
+    });
   });
 });

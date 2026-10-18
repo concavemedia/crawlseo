@@ -30,7 +30,10 @@ const { db, tx, lookup, row } = vi.hoisted(() => {
     tx,
     lookup: vi.fn(),
     db: {
-      site: { findUnique: vi.fn(async () => ({ userId: row.userId })), update },
+      site: {
+        findUnique: vi.fn(async () => ({ userId: row.userId, domain: row.domain, gscProperty: row.gscProperty })),
+        update,
+      },
       $transaction: vi.fn(async (run: (t: typeof tx) => Promise<unknown>) => run(tx)),
     },
   };
@@ -41,6 +44,7 @@ vi.mock("@/lib/auth", () => ({ auth: vi.fn(async () => ({ user: { id: "user-1" }
 // Only DNS is faked, so the real assertPublicDomain decides what is private.
 vi.mock("dns/promises", () => ({ lookup, default: { lookup } }));
 
+import { setSitePolicy } from "@/lib/site-policy";
 import { PUT } from "./route";
 
 const DNS: Record<string, string> = {
@@ -59,6 +63,7 @@ function put(body: unknown) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  setSitePolicy(null);
   Object.assign(row, {
     domain: "quilltab.app",
     gscProperty: "sc-domain:quilltab.app",
@@ -122,6 +127,57 @@ describe("PUT /api/sites/[siteId] domain", () => {
     expect(res.status).toBe(200);
     expect(lookup).not.toHaveBeenCalled();
     expect(row.domain).toBe("quilltab.app");
+  });
+});
+
+describe("PUT /api/sites/[siteId] and the site policy", () => {
+  it("asks the policy about the site as it would be after the change, and refuses with its status", async () => {
+    const canUpdate = vi.fn(async () => ({ ok: false as const, reason: "Verify this site in Search Console first", status: 403 }));
+    setSitePolicy({ canUpdate });
+
+    const res = await put({ domain: "new-site.com" });
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: "Verify this site in Search Console first" });
+    expect(canUpdate).toHaveBeenCalledWith(
+      { id: "user-1" },
+      { id: "site-1", domain: "new-site.com", gscProperty: "sc-domain:quilltab.app" }
+    );
+    expect(db.site.update).not.toHaveBeenCalled();
+    expect(row.domain).toBe("quilltab.app");
+  });
+
+  it("falls back to canAdd for a new property", async () => {
+    const canAdd = vi.fn(async () => ({ ok: false as const, reason: "Not verified", status: 403 }));
+    setSitePolicy({ canAdd });
+
+    const res = await put({ gscProperty: "sc-domain:other.example" });
+
+    expect(res.status).toBe(403);
+    expect(canAdd).toHaveBeenCalledWith(
+      { id: "user-1" },
+      { domain: "quilltab.app", gscProperty: "sc-domain:other.example", siteId: "site-1" }
+    );
+  });
+
+  it("does not ask the policy when the values sent are the current ones", async () => {
+    const canUpdate = vi.fn(async () => ({ ok: false as const, reason: "No", status: 403 }));
+    setSitePolicy({ canUpdate });
+
+    const res = await put({ gscProperty: "sc-domain:quilltab.app" });
+
+    expect(res.status).toBe(200);
+    expect(canUpdate).not.toHaveBeenCalled();
+  });
+
+  it("does not ask the policy when only the Bing property changes", async () => {
+    const canUpdate = vi.fn(async () => ({ ok: false as const, reason: "No", status: 403 }));
+    setSitePolicy({ canUpdate });
+
+    const res = await put({ bingSite: "https://quilltab.app/" });
+
+    expect(res.status).toBe(200);
+    expect(canUpdate).not.toHaveBeenCalled();
   });
 });
 

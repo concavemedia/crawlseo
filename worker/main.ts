@@ -1,3 +1,4 @@
+import { registerExtensions } from "@/extensions";
 import { db } from "@/lib/db";
 import { crashHandlers, startWorker, type Worker } from "./worker";
 
@@ -5,6 +6,7 @@ import { crashHandlers, startWorker, type Worker } from "./worker";
 // build:worker); in development: npm run worker.
 
 async function main() {
+  registerExtensions();
   let worker: Worker | undefined;
   const crash = crashHandlers(() => worker, { exit: (code) => process.exit(code) });
   process.on("unhandledRejection", crash.unhandledRejection);

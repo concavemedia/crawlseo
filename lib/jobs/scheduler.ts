@@ -24,9 +24,16 @@ import { requestCrawl } from "./site-jobs";
  *   An upgrade, turning a type on after weeks off, or moving from a
  *   serverless host to Docker therefore does not start crawling every site
  *   at once.
+ *
+ * A fork adds schedules of its own (registerSchedule), leaves sites out of
+ * every schedule (registerScheduleFilter) and runs short upkeep once per pass
+ * (registerSchedulerTask), from extensions/index.ts, without editing this file.
  */
 
 type Db = PrismaClient;
+
+/** How many sites' due rules run at once. */
+const DUE_RULE_BATCH = 10;
 
 /** Processes share one scheduling pass per this interval. */
 export const SCHEDULER_EVERY_MS = 10 * 60_000;
@@ -46,13 +53,25 @@ export function firstRunOffsetMs(siteId: string, type: string, intervalMs: numbe
   return hash.readUIntBE(0, 6) % Math.max(1, intervalMs);
 }
 
-type Site = {
+/** A site as the scheduler sees it. */
+export type ScheduledSite = {
   id: string;
   userId: string;
   createdAt: Date;
   gscProperty: string | null;
   bingSite: string | null;
 };
+type Site = ScheduledSite;
+
+/**
+ * The due rule of a registered schedule. `lastQueuedAt`: when the site's
+ * newest job of the type was queued, null if never. `firstSeenAt`: the first
+ * pass on this database that could schedule the type.
+ */
+export type DueRule = (
+  site: ScheduledSite,
+  ctx: { now: Date; lastQueuedAt: Date | null; firstSeenAt: Date }
+) => boolean | Promise<boolean>;
 
 type Schedule = {
   type: string;
@@ -60,9 +79,93 @@ type Schedule = {
   applies: (site: Site, ctx: { bingKeyUsers: Set<string> }) => boolean;
   /** Crawls and vitals: spread the first run instead of running it at once. */
   spreadFirst: boolean;
+  /** Replaces the interval rule. */
+  isDue?: DueRule;
 };
 
+/**
+ * A schedule a fork registers. Its job type must be registered too
+ * (registerJobHandler). Either `intervalMs` (the same rule as the built-in
+ * schedules) or `isDue` decides when a site is due. A registered schedule
+ * with the type of a built-in one replaces it entirely: the SCHEDULE_* env
+ * interval, the built-in `applies` (such as "has a Search Console property")
+ * and `spreadFirst` no longer apply unless it sets them itself.
+ */
+export type CustomSchedule = {
+  type: string;
+  /** Which sites it covers; every site by default. */
+  applies?: (site: ScheduledSite) => boolean;
+  intervalMs?: number;
+  /** With intervalMs: spread each site's first run over the first interval. */
+  spreadFirst?: boolean;
+  isDue?: DueRule;
+};
+
+/** Gets every site a pass would schedule, returns those it may schedule. Throwing skips the pass's scheduling. */
+export type ScheduleFilter = (sites: ScheduledSite[], ctx: { now: Date }) => ScheduledSite[] | Promise<ScheduledSite[]>;
+
+/**
+ * Upkeep that runs once per scheduling pass across processes, after the
+ * pass has queued its jobs. Keep it short: after SCHEDULER_TASK_TIMEOUT_MS
+ * the pass stops waiting for it. Queue a job for long work.
+ */
+export type SchedulerTask = (db: Db, ctx: { now: Date }) => Promise<void>;
+
+/** On globalThis like the job handler registry: a route and a server action may load separate copies of this module. */
+const extras = globalThis as unknown as {
+  crawlseoSchedules?: Map<string, CustomSchedule>;
+  crawlseoScheduleFilters?: Set<ScheduleFilter>;
+  crawlseoSchedulerTasks?: Map<string, SchedulerTask>;
+};
+const customSchedules = (extras.crawlseoSchedules ??= new Map());
+const scheduleFilters = (extras.crawlseoScheduleFilters ??= new Set());
+const schedulerTasks = (extras.crawlseoSchedulerTasks ??= new Map());
+
+/** Adds a schedule, or replaces the one of the same type. Returns a function that removes it. */
+export function registerSchedule(schedule: CustomSchedule): () => void {
+  if (!schedule.type.trim()) throw new Error("A schedule needs a job type");
+  const hasInterval = Number.isFinite(schedule.intervalMs) && (schedule.intervalMs ?? 0) > 0;
+  if (!schedule.isDue && !hasInterval) {
+    throw new Error(`Schedule ${schedule.type}: give a positive intervalMs or an isDue rule`);
+  }
+  customSchedules.set(schedule.type, schedule);
+  return () => {
+    if (customSchedules.get(schedule.type) === schedule) customSchedules.delete(schedule.type);
+  };
+}
+
+/** Adds a filter every pass applies to the sites before any schedule. Returns a function that removes it. */
+export function registerScheduleFilter(filter: ScheduleFilter): () => void {
+  scheduleFilters.add(filter);
+  return () => {
+    scheduleFilters.delete(filter);
+  };
+}
+
+/** Adds a task, or replaces the one of the same name. Returns a function that removes it. */
+export function registerSchedulerTask(name: string, task: SchedulerTask): () => void {
+  if (!name.trim()) throw new Error("A scheduler task needs a name");
+  schedulerTasks.set(name, task);
+  return () => {
+    if (schedulerTasks.get(name) === task) schedulerTasks.delete(name);
+  };
+}
+
 function schedules(config: ScheduleConfig): Schedule[] {
+  const custom = [...customSchedules.values()].map(
+    (c): Schedule => ({
+      type: c.type,
+      intervalMs: c.intervalMs ?? 0,
+      spreadFirst: c.spreadFirst ?? false,
+      applies: (site) => (c.applies ? c.applies(site) : true),
+      isDue: c.isDue,
+    })
+  );
+  const replaced = new Set(custom.map((c) => c.type));
+  return [...builtInSchedules(config).filter((b) => !replaced.has(b.type)), ...custom];
+}
+
+function builtInSchedules(config: ScheduleConfig): Schedule[] {
   return [
     { type: GSC_SYNC_JOB, intervalMs: config.gscSyncMs, spreadFirst: false, applies: (s) => Boolean(s.gscProperty) },
     {
@@ -108,6 +211,44 @@ async function deleteOldJobs(db: Db, now: Date, retentionMs: number): Promise<nu
 
 export type SchedulerResult = { ran: boolean; queued: Record<string, number>; deleted: number };
 
+/** A task still running after this is logged and left behind, so the pass can end. */
+export const SCHEDULER_TASK_TIMEOUT_MS = 30_000;
+
+async function runTasks(db: Db, now: Date): Promise<void> {
+  for (const [name, task] of schedulerTasks) {
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), SCHEDULER_TASK_TIMEOUT_MS);
+      timer.unref?.();
+    });
+    try {
+      const outcome = await Promise.race([task(db, { now }).then(() => "done" as const), timeout]);
+      if (outcome === "timeout") {
+        console.error(`[jobs] scheduler task ${name} still running after ${SCHEDULER_TASK_TIMEOUT_MS / 1000} s; not waiting for it`);
+      }
+    } catch (err) {
+      console.error(`[jobs] scheduler task ${name} failed:`, err);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}
+
+/** The sites every registered filter lets through, or null when a filter failed (nothing is scheduled then). */
+async function filterSites(sites: Site[], now: Date): Promise<Site[] | null> {
+  let kept = sites;
+  for (const filter of scheduleFilters) {
+    try {
+      const allowed = new Set((await filter(kept, { now })).map((s) => s.id));
+      kept = kept.filter((s) => allowed.has(s.id));
+    } catch (err) {
+      console.error("[jobs] schedule filter failed; nothing is scheduled on this pass:", err);
+      return null;
+    }
+  }
+  return kept;
+}
+
 /**
  * One scheduling pass. `types` limits which job types it queues (a serverless
  * host queues only SHORT ones: nothing runs LONG jobs there on a schedule).
@@ -124,19 +265,31 @@ export async function runScheduler(
   if (!(await takePass(db, now, opts.force ?? false))) return { ran: false, queued, deleted: 0 };
 
   const deleted = await deleteOldJobs(db, now, config.retentionMs);
-  if (!config.enabled) return { ran: true, queued, deleted };
+  // Tasks run after the built-in work, so a slow one never holds it up.
+  if (config.enabled) await scheduleSites(db, config, allowed, now, queued);
+  await runTasks(db, now);
+  return { ran: true, queued, deleted };
+}
 
-  const sites: Site[] = await db.site.findMany({
+async function scheduleSites(
+  db: Db,
+  config: ScheduleConfig,
+  allowed: Set<string>,
+  now: Date,
+  queued: Record<string, number>
+): Promise<void> {
+  const all: Site[] = await db.site.findMany({
     select: { id: true, userId: true, createdAt: true, gscProperty: true, bingSite: true },
     orderBy: { createdAt: "asc" },
   });
-  if (sites.length === 0) return { ran: true, queued, deleted };
+  const sites = all.length ? await filterSites(all, now) : all;
+  if (!sites || sites.length === 0) return;
   const bingKeyUsers = new Set(
     (await db.apiKey.findMany({ where: { provider: "bing" }, select: { userId: true } })).map((k) => k.userId)
   );
 
   for (const schedule of schedules(config)) {
-    if (schedule.intervalMs <= 0 || !allowed.has(schedule.type)) continue;
+    if ((schedule.intervalMs <= 0 && !schedule.isDue) || !allowed.has(schedule.type)) continue;
     const firstSeenAt = await firstSeen(db, schedule.type, now);
     const due = await dueSites(db, schedule, sites, { now, firstSeenAt, bingKeyUsers });
     for (const site of due) {
@@ -148,7 +301,6 @@ export async function runScheduler(
       }
     }
   }
-  return { ran: true, queued, deleted };
 }
 
 /**
@@ -176,6 +328,27 @@ async function dueSites(
       r._max.createdAt,
     ])
   );
+  if (schedule.isDue) {
+    const isDue = schedule.isDue;
+    const applicable = sites.filter((site) => schedule.applies(site, ctx));
+    const due: Site[] = [];
+    // A few at a time: a rule that queries the database must not exhaust its pool.
+    for (let i = 0; i < applicable.length; i += DUE_RULE_BATCH) {
+      const batch = applicable.slice(i, i + DUE_RULE_BATCH);
+      const results = await Promise.all(
+        batch.map(async (site) => {
+          try {
+            return await isDue(site, { now: ctx.now, lastQueuedAt: latest.get(site.id) ?? null, firstSeenAt: ctx.firstSeenAt });
+          } catch (err) {
+            console.error(`[jobs] due rule of ${type} failed for site ${site.id}:`, err);
+            return false;
+          }
+        })
+      );
+      due.push(...batch.filter((_, j) => results[j]));
+    }
+    return due;
+  }
   const before = schedule.spreadFirst ? await lastRunBeforeQueue(db, type) : new Map<string, Date>();
   const slack = slackMs(intervalMs);
   const now = ctx.now.getTime();

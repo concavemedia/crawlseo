@@ -6,6 +6,7 @@ import { GSC_SYNC_JOB } from "@/lib/jobs/handlers";
 import { requestSiteJob } from "@/lib/jobs/site-jobs";
 import { ensureDefaultAlerts } from "@/lib/alerts/evaluate";
 import { siteDomainFromProperty } from "@/lib/site-domain";
+import { canAddSite, siteCreated } from "@/lib/site-policy";
 
 // On a serverless host the first GSC sync runs after the response, within this
 // limit (SERVERLESS_MAX_DURATION_S in lib/jobs/config.ts; Next needs a literal here).
@@ -101,6 +102,11 @@ export async function POST(req: Request) {
       );
     }
 
+    const permission = await canAddSite({ id: session.user.id }, { domain, gscProperty });
+    if (!permission.ok) {
+      return Response.json({ error: permission.reason }, { status: permission.status });
+    }
+
     // Create the site
     const site = await db.site.create({
       data: {
@@ -127,6 +133,8 @@ export async function POST(req: Request) {
         console.error("Could not queue the initial GSC sync:", err);
       }
     }
+
+    await siteCreated({ ...site, userId: session.user.id });
 
     return Response.json(site, { status: 201 });
   } catch (error) {

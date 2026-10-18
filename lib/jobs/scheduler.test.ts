@@ -1,5 +1,5 @@
 import type { PrismaClient } from "@prisma/client";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 // The scheduler against the real Prisma client on PGlite, with an explicit
 // clock: due rules, the spread of first crawls and vitals checks after an
@@ -13,8 +13,17 @@ vi.mock("@/lib/db", async () => {
 
 import { createTestDb, type TestDb } from "@/lib/testing/pglite";
 import { scheduleConfig, type ScheduleConfig } from "./config";
-import { jobTypes } from "./handlers";
-import { firstRunOffsetMs, runScheduler, SCHEDULER_EVERY_MS, slackMs } from "./scheduler";
+import { jobTypes, registerJobHandler } from "./handlers";
+import {
+  firstRunOffsetMs,
+  registerSchedule,
+  registerScheduleFilter,
+  registerSchedulerTask,
+  runScheduler,
+  SCHEDULER_EVERY_MS,
+  SCHEDULER_TASK_TIMEOUT_MS,
+  slackMs,
+} from "./scheduler";
 import { requestCrawl } from "./site-jobs";
 
 const MIN = 60_000;
@@ -241,6 +250,126 @@ describe("a person's request takes over a queued scheduled job", () => {
       priority: 10,
       payload: { maxPages: 25 },
     });
+  });
+});
+
+describe("schedules, filters and tasks a fork registers", () => {
+  const REPORT = "test-report";
+  const cleanups: (() => void)[] = [];
+  const later = (fn: () => void) => cleanups.push(fn);
+
+  beforeAll(() => {
+    registerJobHandler({ type: REPORT, class: "SHORT", maxAttempts: 1, isPermanent: () => true, run: async () => undefined });
+  });
+
+  afterEach(() => {
+    while (cleanups.length) cleanups.pop()!();
+    vi.restoreAllMocks();
+  });
+
+  const reportJobs = () => db.job.findMany({ where: { type: REPORT }, select: { siteId: true } });
+
+  it("queues a registered type for the sites its due rule picks, with the last time it was queued", async () => {
+    const seen: (Date | null)[] = [];
+    later(
+      registerSchedule({
+        type: REPORT,
+        applies: (site) => site.id < "site-05",
+        isDue: (site, ctx) => {
+          seen.push(ctx.lastQueuedAt);
+          expect(ctx.firstSeenAt).toEqual(at(0));
+          return site.id !== "site-02";
+        },
+      })
+    );
+    const result = await runScheduler(db, { now: at(0), config });
+    expect(result.queued[REPORT]).toBe(4);
+    expect((await reportJobs()).map((j) => j.siteId).sort()).toEqual(["site-00", "site-01", "site-03", "site-04"]);
+    expect(seen).toEqual([null, null, null, null, null]);
+
+    // Next pass: the due rule sees the job it queued.
+    seen.length = 0;
+    await runScheduler(db, { now: at(SCHEDULER_EVERY_MS), config });
+    expect(seen.filter((d) => d instanceof Date)).toHaveLength(4);
+  });
+
+  it("queues a registered type on an interval, once per interval", async () => {
+    later(registerSchedule({ type: REPORT, intervalMs: DAY }));
+    expect((await runScheduler(db, { now: at(0), config })).queued[REPORT]).toBe(SITES.length);
+    await db.job.updateMany({ where: { type: REPORT }, data: { status: "SUCCEEDED", activeKey: null } });
+    expect((await runScheduler(db, { now: at(SCHEDULER_EVERY_MS), config })).queued[REPORT]).toBeUndefined();
+  });
+
+  it("replaces the built-in schedule of the same type", async () => {
+    later(registerSchedule({ type: "gsc-sync", isDue: () => false }));
+    const result = await runScheduler(db, { now: at(0), config });
+    expect(result.queued["gsc-sync"]).toBeUndefined();
+  });
+
+  it("refuses a schedule with neither an interval nor a due rule", () => {
+    expect(() => registerSchedule({ type: REPORT })).toThrow(/intervalMs or an isDue/);
+    expect(() => registerSchedule({ type: REPORT, intervalMs: 0 })).toThrow(/intervalMs or an isDue/);
+  });
+
+  it("leaves the sites a filter drops out of every schedule", async () => {
+    later(registerSchedule({ type: REPORT, isDue: () => true }));
+    later(registerScheduleFilter((sites) => sites.filter((s) => s.id !== "site-00")));
+    const result = await runScheduler(db, { now: at(0), config });
+    expect(result.queued["gsc-sync"]).toBe(SITES.length - 1);
+    expect(result.queued[REPORT]).toBe(SITES.length - 1);
+    expect(await db.job.count({ where: { siteId: "site-00" } })).toBe(0);
+  });
+
+  it("schedules nothing on a pass whose filter fails", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    later(
+      registerScheduleFilter(() => {
+        throw new Error("lookup failed");
+      })
+    );
+    const result = await runScheduler(db, { now: at(0), config });
+    expect(result).toMatchObject({ ran: true, queued: {} });
+    expect(await db.job.count()).toBe(0);
+  });
+
+  it("runs tasks once per pass, also with the scheduler off, and a failing one stops nothing", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const task = vi.fn(async () => {});
+    later(registerSchedulerTask("count", task));
+    later(
+      registerSchedulerTask("broken", async () => {
+        throw new Error("boom");
+      })
+    );
+    const first = await runScheduler(db, { now: at(0), config });
+    expect(first.queued["gsc-sync"]).toBe(SITES.length);
+    expect(task).toHaveBeenCalledTimes(1);
+    // Not toHaveBeenCalledWith: deep-comparing the Prisma client recurses forever.
+    const [taskDb, taskCtx] = task.mock.calls[0] as unknown as [PrismaClient, { now: Date }];
+    expect(taskDb).toBe(db);
+    expect(taskCtx).toEqual({ now: at(0) });
+
+    // Another process within the same 10 minutes: no pass, no task.
+    await runScheduler(db, { now: at(SCHEDULER_EVERY_MS / 2), config });
+    expect(task).toHaveBeenCalledTimes(1);
+
+    await runScheduler(db, { now: at(SCHEDULER_EVERY_MS), config: { ...config, enabled: false } });
+    expect(task).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops waiting for a task that hangs, after the jobs are queued", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    later(registerSchedulerTask("hangs", () => new Promise<void>(() => {})));
+    try {
+      const pass = runScheduler(db, { now: at(0), config });
+      await vi.waitFor(async () => expect(await db.job.count({ where: { type: "gsc-sync" } })).toBe(SITES.length));
+      await vi.advanceTimersByTimeAsync(SCHEDULER_TASK_TIMEOUT_MS);
+      expect((await pass).queued["gsc-sync"]).toBe(SITES.length);
+      expect(log).toHaveBeenCalledWith(expect.stringContaining("scheduler task hangs still running"));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

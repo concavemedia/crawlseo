@@ -13,6 +13,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
+import { registerExtensions } from "../extensions";
 import { db } from "../lib/db";
 import {
   getSitePeriodMetrics,
@@ -291,6 +292,8 @@ server.tool(
 // ---------------------------------------------------------------------------
 
 async function main() {
+  // A fork's job types and policies (extensions/index.ts), before any tool can queue a crawl.
+  registerExtensions();
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("CrawlSEO MCP server running on stdio");
