@@ -1,6 +1,6 @@
 import { createHash } from "crypto";
 import type { PrismaClient } from "@prisma/client";
-import { scheduleConfig, type ScheduleConfig } from "./config";
+import { DAY, scheduleConfig, type ScheduleConfig } from "./config";
 import { BING_SYNC_JOB, CRAWL_JOB, GSC_SYNC_JOB, jobTypes, VITALS_JOB } from "./handlers";
 import { DEFAULT_CRAWL_PAGES } from "./policy";
 import { enqueueJob } from "./queue";
@@ -24,6 +24,12 @@ import { requestCrawl } from "./site-jobs";
  *   An upgrade, turning a type on after weeks off, or moving from a
  *   serverless host to Docker therefore does not start crawling every site
  *   at once.
+ *
+ * Each user can change the crawl and vitals intervals of their own sites in
+ * Settings > Schedule (UserSettings, lib/user-settings.ts): another number of
+ * days, or off. The SCHEDULE_* value is the default for everyone else, and a
+ * type the server turned off (0, or SCHEDULER_ENABLED=false) stays off
+ * whatever a user set.
  *
  * A fork adds schedules of its own (registerSchedule), leaves sites out of
  * every schedule (registerScheduleFilter) and runs short upkeep once per pass
@@ -73,10 +79,17 @@ export type DueRule = (
   ctx: { now: Date; lastQueuedAt: Date | null; firstSeenAt: Date }
 ) => boolean | Promise<boolean>;
 
+/** Per user: the crawl and vitals intervals set in Settings, in days (null: the server default). */
+type UserIntervals = Map<string, { crawlScheduleDays: number | null; vitalsScheduleDays: number | null }>;
+
+type PassContext = { bingKeyUsers: Set<string>; userIntervals: UserIntervals };
+
 type Schedule = {
   type: string;
   intervalMs: number;
-  applies: (site: Site, ctx: { bingKeyUsers: Set<string> }) => boolean;
+  applies: (site: Site, ctx: PassContext) => boolean;
+  /** The interval of this site when it can differ from intervalMs (a user's setting). 0: not scheduled. */
+  siteIntervalMs?: (site: Site, ctx: PassContext) => number;
   /** Crawls and vitals: spread the first run instead of running it at once. */
   spreadFirst: boolean;
   /** Replaces the interval rule. */
@@ -174,9 +187,26 @@ function builtInSchedules(config: ScheduleConfig): Schedule[] {
       spreadFirst: false,
       applies: (s, ctx) => Boolean(s.bingSite) && ctx.bingKeyUsers.has(s.userId),
     },
-    { type: CRAWL_JOB, intervalMs: config.crawlMs, spreadFirst: true, applies: () => true },
-    { type: VITALS_JOB, intervalMs: config.vitalsMs, spreadFirst: true, applies: () => true },
+    {
+      type: CRAWL_JOB,
+      intervalMs: config.crawlMs,
+      spreadFirst: true,
+      applies: () => true,
+      siteIntervalMs: (s, ctx) => userInterval(ctx.userIntervals.get(s.userId)?.crawlScheduleDays, config.crawlMs),
+    },
+    {
+      type: VITALS_JOB,
+      intervalMs: config.vitalsMs,
+      spreadFirst: true,
+      applies: () => true,
+      siteIntervalMs: (s, ctx) => userInterval(ctx.userIntervals.get(s.userId)?.vitalsScheduleDays, config.vitalsMs),
+    },
   ];
+}
+
+/** A user's interval in days, or the server's when they set none. */
+function userInterval(days: number | null | undefined, serverMs: number): number {
+  return days === null || days === undefined || !Number.isFinite(days) || days < 0 ? serverMs : days * DAY;
 }
 
 /**
@@ -287,11 +317,20 @@ async function scheduleSites(
   const bingKeyUsers = new Set(
     (await db.apiKey.findMany({ where: { provider: "bing" }, select: { userId: true } })).map((k) => k.userId)
   );
+  const userIntervals: UserIntervals = new Map(
+    (
+      await db.userSettings.findMany({
+        where: { OR: [{ crawlScheduleDays: { not: null } }, { vitalsScheduleDays: { not: null } }] },
+        select: { userId: true, crawlScheduleDays: true, vitalsScheduleDays: true },
+      })
+    ).map(({ userId, ...days }) => [userId, days])
+  );
 
   for (const schedule of schedules(config)) {
+    // Off on this server: no user setting turns it back on.
     if ((schedule.intervalMs <= 0 && !schedule.isDue) || !allowed.has(schedule.type)) continue;
     const firstSeenAt = await firstSeen(db, schedule.type, now);
-    const due = await dueSites(db, schedule, sites, { now, firstSeenAt, bingKeyUsers });
+    const due = await dueSites(db, schedule, sites, { now, firstSeenAt, bingKeyUsers, userIntervals });
     for (const site of due) {
       try {
         const created = await queueScheduled(db, schedule.type, site);
@@ -319,9 +358,9 @@ async function dueSites(
   db: Db,
   schedule: Schedule,
   sites: Site[],
-  ctx: { now: Date; firstSeenAt: Date; bingKeyUsers: Set<string> }
+  ctx: PassContext & { now: Date; firstSeenAt: Date }
 ): Promise<Site[]> {
-  const { type, intervalMs } = schedule;
+  const { type } = schedule;
   const latest = new Map(
     (await db.job.groupBy({ by: ["siteId"], where: { type }, _max: { createdAt: true } })).map((r) => [
       r.siteId,
@@ -350,11 +389,13 @@ async function dueSites(
     return due;
   }
   const before = schedule.spreadFirst ? await lastRunBeforeQueue(db, type) : new Map<string, Date>();
-  const slack = slackMs(intervalMs);
   const now = ctx.now.getTime();
 
   return sites.filter((site) => {
     if (!schedule.applies(site, ctx)) return false;
+    const intervalMs = schedule.siteIntervalMs?.(site, ctx) ?? schedule.intervalMs;
+    if (intervalMs <= 0) return false;
+    const slack = slackMs(intervalMs);
     const last = latest.get(site.id);
     if (last) return now - last.getTime() >= intervalMs - slack;
     if (!schedule.spreadFirst) return true;
